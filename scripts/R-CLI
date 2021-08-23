@@ -1,0 +1,89 @@
+#!/bin/sh
+
+#hostname
+export hostN="R-CLI"
+
+export if1N="ens192"
+export if1IP="192.168.100.100"
+export if1Mask="255.255.255.0"
+export if1CIDR="/24"
+export defGW="192.168.100.1"
+
+export cleanupswitch=0
+
+    #base setup
+echo "Setting hostname"
+echo $hostN > /etc/hostname
+#sed -i.bak 's%files dns%dns files%g' /etc/nsswitch.conf
+
+baseCentOS() {
+    echo "Disabling firewall and SELinux..."
+    systemctl disable -q --now firewalld #allow pings
+    sed -i.bak "s/SELINUX=.*/SELINUX=disabled/g" /etc/selinux/config
+    echo "Mounting disks..."
+	mkdir /media/cdrom
+	mount -r /dev/sr1 /media/cdrom
+	mkdir /media/CentOS
+	mount -r /dev/sr0 /media/CentOS
+	echo "Installing packages..."
+	yum --disablerepo=* --enablerepo=c7-media -q makecache >/dev/null 2>&1
+	yum --disablerepo=* --enablerepo=c7-media -q -y install tcpdump net-tools vim lynx bind-utils nfs-utils cifs-utils openssh-server nano>/dev/null 2>&1
+	yum --disablerepo=* --enablerepo=c7-media -y install $(find /media/ -name sshpass*) >/dev/null 2>&1
+	echo "Packages installed"
+}
+
+ipConfig() {
+echo "Replacing net config... "
+cat > /etc/sysconfig/network-scripts/ifcfg-$if1N << EOF
+DEVICE=$if1N
+ONBOOT=yes
+IPADDR=$if1IP
+NETMASK=$if1Mask
+GATEWAY=$defGW
+EOF
+echo $if1N
+ifdown $if1N > /etc/null
+ifup $if1N > /etc/null
+}
+
+hosts() {
+	echo "Adding hostnames to /etc/hosts"
+	cat >> /etc/hosts << EOF
+10.10.10.10	ISP
+10.10.10.1	L-FW
+20.20.20.5	OUT-CLI
+20.20.20.100	R-FW
+172.16.20.10	L-SRV
+172.16.50.2	L-RTR-A
+#172.16.100.61	L-CLI-A
+172.16.55.2	L-RTR-B
+172.16.200.61	L-CLI-B
+192.168.20.10	R-SRV
+192.168.10.2	R-RTR
+192.168.100.100	R-CLI
+EOF
+}
+
+sshdEdit() {
+	echo "Permitting root login"
+	sed -i.bak "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config
+	echo "Restarting sshd..."
+	systemctl restart sshd
+}
+
+cleanup() {
+	echo "Cleaning up and disabling history..."
+	echo 'set +o history' >> /etc/profile
+	history -c
+}
+
+ipConfig
+baseCentOS
+sshdEdit
+hosts
+
+if [[ $cleanupswitch == 1 ]]; then cleanup; fi
+
+echo DONE
+rm -f $0
+reboot

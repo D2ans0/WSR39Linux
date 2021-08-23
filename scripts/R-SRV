@@ -1,0 +1,113 @@
+#!/bin/sh
+
+#hostname
+export hostN="R-SRV"
+
+
+export if1N="ens192"
+export if1IP="192.168.20.10"
+export if1Mask="255.255.255.0"
+export if1CIDR="/24"
+export defGW="192.168.20.1"
+export cleanupswitch=0
+
+    #base setup
+echo "Setting hostname and enabling packet forwarding..."
+echo $hostN > /etc/hostname
+echo net.ipv4.ip_forward=1 > /etc/sysctl.conf
+#sed -i.bak 's%files dns%dns files%g' /etc/nsswitch.conf
+
+#ip config
+ipConfig() {
+echo -n "Replacing net config... "
+cat > /etc/sysconfig/network-scripts/ifcfg-$if1N << EOF
+DEVICE=$if1N
+ONBOOT=yes
+IPADDR=$if1IP
+NETMASK=$if1Mask
+GATEWAY=$defGW
+EOF
+echo -n $if1N/
+ifdown $if1N > /etc/null
+ifup $if1N > /etc/null
+}
+
+baseCentOS() {
+    echo "Disabling firewall and SELinux..."
+    systemctl disable -q --now firewalld #allow pings
+    echo SELINUX=disabled > /etc/selinux/config
+    echo "Mounting disks..."
+	mkdir /media/cdrom
+	mount -r /dev/sr1 /media/cdrom
+	mkdir /media/CentOS
+	mount -r /dev/sr0 /media/CentOS
+	echo "Installing packages..."
+	yum --disablerepo=* --enablerepo=c7-media -q makecache >/dev/null 2>&1
+	yum --disablerepo=* --enablerepo=c7-media -q -y install tcpdump net-tools vim lynx bind-utils nfs-utils cifs-utils openssh-server nano httpd php >/dev/null 2>&1
+	yum --disablerepo=* --enablerepo=c7-media -y install $(find /media/ -name sshpass*) >/dev/null 2>&1
+	echo "Packages installed"
+}
+
+hosts() {
+	echo "Adding hostnames to /etc/hosts"
+	cat >> /etc/hosts << EOF
+10.10.10.10	ISP
+10.10.10.1	L-FW
+20.20.20.5	OUT-CLI
+20.20.20.100	R-FW
+172.16.20.10	L-SRV
+172.16.50.2	L-RTR-A
+#172.16.100.61	L-CLI-A
+172.16.55.2	L-RTR-B
+172.16.200.61	L-CLI-B
+192.168.20.10	R-SRV
+192.168.10.2	R-RTR
+192.168.100.100	R-CLI
+EOF
+}
+
+sshdEdit() {
+echo "Permitting root login"
+sed -i.bak "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config
+echo "Restarting sshd..."
+systemctl restart sshd
+}
+
+apacheserver() {
+echo "Configuring apache server and making sites..."
+mkdir -p /var/www/html/out
+cp /etc/httpd/conf/httpd.conf /etc/httpd/conf/httpd.conf.old
+sed -i.bak 's%/var/www/html%/var/www/html/out%g' /etc/httpd/conf/httpd.conf
+sed -i.bak 's%Listen 80%Listen 8088%g' /etc/httpd/conf/httpd.conf
+cat > /var/www/html/out/index.html << EOF
+<!DOCTYPE HTML>
+<head>
+<title>WorldSkills</title>
+</head>
+<body>
+Hello, www.skill39.wsr is here!
+</body>
+EOF
+echo -e '<?php echo date("Y-m-d H:i:s"); ?>' > /var/www/html/out/date.php
+echo -e "127.0.0.1 www.skill39.wsr" >> /etc/hosts
+echo "Restarting httpd service..."
+systemctl enable httpd
+systemctl start httpd
+}
+
+cleanup() {
+	echo 'set +o history' >> /etc/profile
+	history -c
+}
+
+ipConfig
+baseCentOS
+hosts
+sshdEdit
+apacheserver
+if [[ $cleanupswitch == 1 ]]; then cleanup; fi
+
+echo DONE
+rm -f $0
+sleep 60
+reboot

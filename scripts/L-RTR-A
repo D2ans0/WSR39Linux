@@ -1,0 +1,166 @@
+#!/bin/sh
+
+#hostname
+export hostN="L-RTR-A"
+
+
+export if1N="ens192"
+export if1IP="172.16.50.2/30"
+export if2N="ens224"
+export if2IP="172.16.100.1/24"
+export defGW="172.16.50.1"
+export cleanupswitch=0
+
+    #base setup
+echo "Setting hostname and enabling ipforwarding..."
+echo $hostN > /etc/hostname
+echo net.ipv4.ip_forward=1 > /etc/sysctl.conf
+#sed -i.bak 's%files dns%dns files%g' /etc/nsswitch.conf
+
+#ip config
+ipConfig() {
+	sed -i.bak '11,$d' /etc/network/interfaces
+	echo "Replacing net config..."
+	cat >> /etc/network/interfaces << EOF
+auto $if1N
+iface $if1N inet static
+	address $if1IP
+	gateway $defGW
+	post-up /etc/network/if-up.d/ipTables.sh
+EOF
+	echo -n $if1N/
+
+	cat >> /etc/network/interfaces << EOF
+auto $if2N
+iface $if2N inet static
+    address $if2IP
+	gateway $defGW
+EOF
+	echo $if2N
+	echo "Restarting networking..."
+	systemctl restart networking >/dev/null 2>&1
+}
+
+baseDeb() {
+    echo "Disabling apparmor..."
+	systemctl disable -q --now apparmor #lowers security, but makes our job easier
+#packages debian
+	echo "Adding disks..."
+	apt-cdrom add >/dev/null 2>&1
+    echo "Installing packages..."
+	apt-get install -qqqy --ignore-missing tcpdump net-tools curl vim lynx bind9utils nfs-common cifs-utils sshpass network-manager openssh-server nano isc-dhcp-server frr >/dev/null 2>&1
+}
+
+ipTablesGRE() {
+	echo "Adding iptables NAT rule"
+	iptables-save > /etc/iptables.up.rules
+	echo "Saving rules and making persistent..."
+	cat > /etc/network/if-up.d/ipTables.sh << EOF
+#!/bin/bash
+	logger "\$0: Working on ens192 with \$2 ..."
+	iptables-restore /etc/iptables.up.rules
+EOF
+	chmod 777 /etc/network/if-up.d/ipTables.sh
+}
+
+hosts() {
+	echo "Adding hostnames to /etc/hosts"
+	cat >> /etc/hosts << EOF
+10.10.10.10	ISP
+10.10.10.1	L-FW
+20.20.20.5	OUT-CLI
+20.20.20.100	R-FW
+172.16.20.10	L-SRV
+172.16.50.2	L-RTR-A
+#172.16.100.61	L-CLI-A
+172.16.55.2	L-RTR-B
+172.16.200.61	L-CLI-B
+192.168.20.10	R-SRV
+192.168.10.2	R-RTR
+192.168.100.100	R-CLI
+EOF
+}
+
+sshdEdit() {
+	echo "Permitting root login"
+	sed -i.bak "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config
+	echo "Restarting sshd..."
+	systemctl restart sshd
+}
+
+dhcpSrvConf() {
+	echo "Configuring DHCP server" 
+	cat > /etc/dhcp/dhcpd.conf << EOF
+option domain-name "skill39.wsr";
+option domain-name-servers 172.16.20.10;
+
+default-lease-time 600;
+max-lease-time 7200;
+
+ddns-update-style none;
+
+subnet 172.16.100.0 netmask 255.255.255.0 {
+	range 172.16.100.65 172.16.100.75;
+	option routers 172.16.100.1;
+}
+subnet 172.16.200.0 netmask 255.255.255.0 {
+	range 172.16.200.65 172.16.200.75;
+	option routers 172.16.200.1;
+}
+subnet 172.16.50.0 netmask 255.255.255.252 {
+}
+subnet 172.16.55.0 netmask 255.255.255.252 {
+}
+host L-CLI-B {
+hardware ethernet 00:0C:29:61:B3:65;
+fixed-address 172.16.200.61;
+}		
+EOF
+}
+
+ospf() {
+	echo "Configuring OSPF"
+	sed -i.bak "s/ospfd.*/ospfd=yes/g" /etc/frr/daemons
+	systemctl restart frr
+	cat > /etc/frr/frr.conf << EOF
+frr version 6.0.2
+frr defaults traditional
+hostname $hostN
+log syslog informational
+no ipv6 forwarding
+service integrated-vtysh-config
+!
+router-id 2.2.2.2
+!
+router ospf
+ passive-interface ens224
+ network 1.1.1.1/32 area 0
+ network 172.16.50.0/30 area 0
+ network 172.16.100.0/24 area 0
+!
+line vty
+!
+EOF
+	systemctl restart frr
+}
+
+cleanup() {
+	echo "Cleaning up and disabling history..."
+	echo 'set +o history' >> /etc/profile
+	history -c
+}
+
+sshdEdit
+ipConfig
+baseDeb
+hosts
+ipTablesGRE
+dhcpSrvConf
+ospf
+
+if [[ $cleanupswitch == 1 ]]; then cleanup; fi
+
+echo DONE
+rm -f $0
+sleep 60
+reboot

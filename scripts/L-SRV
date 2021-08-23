@@ -1,0 +1,97 @@
+#!/bin/sh
+
+#hostname
+export hostN="L-SRV"
+
+export if1N="ens192"
+export if1IP="172.16.20.10/24"
+export defGW="172.16.20.1"
+
+export cleanupswitch=0
+
+    #base setup
+echo "Setting hostname"
+echo $hostN > /etc/hostname
+#sed -i.bak 's%files dns%dns files%g' /etc/nsswitch.conf
+
+ipConfig() {
+	sed -i.bak '11,$d' /etc/network/interfaces
+	echo "Replacing net config..."
+	cat >> /etc/network/interfaces << EOF
+auto $if1N
+iface $if1N inet static
+	address $if1IP
+	gateway $defGW
+	post-up /etc/network/if-up.d/ipTables.sh
+EOF
+	echo $if1N
+	echo "Restarting networking..."
+	systemctl restart networking >/dev/null 2>&1
+}
+
+baseDeb() {
+    echo "Disabling apparmor..."
+	systemctl disable -q --now apparmor #lowers security, but makes our job easier
+#packages debian
+	echo "Adding disks..."
+	apt-cdrom add >/dev/null 2>&1
+    echo "Installing packages..."
+	apt-get install -qqqy --ignore-missing tcpdump net-tools curl vim lynx bind9utils nfs-common cifs-utils sshpass network-manager openssh-server nano #slapd ldap-utils migrationtools>/dev/null 2>&1
+}
+
+hosts() {
+	echo "Adding hostnames to /etc/hosts"
+	cat >> /etc/hosts << EOF
+10.10.10.10	ISP
+10.10.10.1	L-FW
+20.20.20.5	OUT-CLI
+20.20.20.100	R-FW
+172.16.20.10	L-SRV
+172.16.50.2	L-RTR-A
+#172.16.100.61	L-CLI-A
+172.16.55.2	L-RTR-B
+172.16.200.61	L-CLI-B
+192.168.20.10	R-SRV
+192.168.10.2	R-RTR
+192.168.100.100	R-CLI
+EOF
+}
+
+sshdEdit() {
+	echo "Permitting root login"
+	sed -i.bak "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config
+	echo "Restarting sshd..."
+	systemctl restart sshd
+}
+
+rSysLogD() {
+	sed -i.bak '/module(load="immark").*/s/^#//' /etc/rsyslog.conf	
+	sed -i.bak '/module(load="imudp").*/s/^#//' /etc/rsyslog.conf
+	sed -i.bak '/input(type="imudp" port="514").*/s/^#//' /etc/rsyslog.conf
+	cat << EOF | sed -i -e '22r /dev/stdin' /etc/rsyslog.conf
+auth.* /opt/logs/L-SRV/auth.log
+if \$hostname contains "L-FW" or \$fromhost-ip contains "172.16.20.1" then {
+*.err /opt/logs/L-FW/error.log
+}
+EOF
+	systemctl restart rsyslog
+}
+
+cleanup() {
+	echo "Cleaning up and disabling history..."
+	echo 'set +o history' >> /etc/profile
+	history -c
+}
+
+ipConfig
+baseCentOS
+sshdEdit
+hosts
+rSysLogD
+
+if [[ $cleanupswitch == 1 ]]; then cleanup; fi
+
+echo DONE
+rm -f $0
+sleep 60
+reboot

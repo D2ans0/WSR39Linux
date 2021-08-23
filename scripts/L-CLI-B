@@ -1,0 +1,65 @@
+#!/bin/sh
+
+#hostname
+export hostN="L-CLI-B"
+
+export cleanupswitch=0
+
+    #base setup
+echo "Setting hostname"
+echo $hostN > /etc/hostname
+#sed -i.bak 's%files dns%dns files%g' /etc/nsswitch.conf
+
+
+
+baseDeb() {
+    echo "Disabling apparmor..."
+	systemctl disable -q --now apparmor #lowers security, but makes our job easier
+#packages debian
+	echo "Adding disks..."
+	apt-cdrom add >/dev/null 2>&1
+    echo "Installing packages..."
+	apt-get install -qqqy --ignore-missing tcpdump net-tools curl vim lynx bind9utils nfs-common cifs-utils sshpass network-manager openssh-server nano openvpn frr >/dev/null 2>&1
+}
+
+hosts() {
+	echo "Adding hostnames to /etc/hosts"
+	cat >> /etc/hosts << EOF
+10.10.10.10	ISP
+10.10.10.1	L-FW
+20.20.20.5	OUT-CLI
+20.20.20.100	R-FW
+172.16.20.10	L-SRV
+172.16.50.2	L-RTR-A
+#172.16.100.61	L-CLI-A
+172.16.55.2	L-RTR-B
+172.16.200.61	L-CLI-B
+192.168.20.10	R-SRV
+192.168.10.2	R-RTR
+192.168.100.100	R-CLI
+EOF
+}
+
+sshdEdit() {
+	echo "Permitting root login"
+	sed -i.bak "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config
+	echo "Restarting sshd..."
+	systemctl restart sshd
+}
+
+cleanup() {
+	echo "Cleaning up and disabling history..."
+	echo 'set +o history' >> /etc/profile
+	history -c
+}
+
+baseDeb
+sshdEdit
+hosts
+
+if [[ $cleanupswitch == 1 ]]; then cleanup; fi
+
+echo DONE
+rm -f $0
+sleep 60
+reboot

@@ -1,0 +1,235 @@
+#!/bin/sh
+
+#hostname
+export hostN="L-FW"
+
+
+export if1N="ens192"
+export if1IP="10.10.10.1/24"
+export if2N="ens224"
+export if2IP="172.16.20.1/24"
+export if3N="ens256"
+export if3IP="172.16.50.1/30"
+export if4N="ens161"
+export if4IP="172.16.55.1/30"
+export defGW="10.10.10.10"
+export cleanupswitch=0
+
+    #base setup
+echo "Setting hostname and enabling ipforwarding..."
+echo $hostN > /etc/hostname
+echo net.ipv4.ip_forward=1 > /etc/sysctl.conf
+#sed -i.bak 's%files dns%dns files%g' /etc/nsswitch.conf
+
+#ip config
+ipConfig() {
+	sed -i.bak '11,$d' /etc/network/interfaces
+	echo "Replacing net config..."
+	cat >> /etc/network/interfaces << EOF
+auto $if1N
+iface $if1N inet static
+	address $if1IP
+	gateway $defGW
+	post-up /etc/network/if-up.d/ipTables.sh
+EOF
+	echo -n $if1N/
+
+	cat >> /etc/network/interfaces << EOF
+auto $if2N
+iface $if2N inet static
+    address $if2IP
+	gateway $defGW
+EOF
+	echo -n $if2N/
+
+	cat >> /etc/network/interfaces << EOF
+auto $if3N
+iface $if3N inet static
+	address $if3IP
+	gateway $defGW
+EOF
+	echo -n $if3N/
+
+	cat >> /etc/network/interfaces << EOF
+auto $if4N
+iface $if4N inet static
+	address $if4IP
+	gateway $defGW
+EOF
+	echo $if4N
+	echo "Restarting networking..."
+	systemctl restart networking >/dev/null 2>&1
+}
+
+baseDeb() {
+    echo "Disabling apparmor..."
+	systemctl disable -q --now apparmor #lowers security, but makes our job easier
+#packages debian
+	echo "Adding disks..."
+	apt-cdrom add >/dev/null 2>&1
+    echo "Installing packages..."
+	apt-get install -qqqy --ignore-missing tcpdump net-tools curl vim lynx bind9utils nfs-common cifs-utils sshpass network-manager openssh-server nano openvpn frr libreswan>/dev/null 2>&1
+}
+
+ipTablesGRE() {
+	echo "Adding iptables NAT rule"
+	iptables -t nat -A POSTROUTING -o ens192 -j MASQUERADE #only on FW
+	iptables-save > /etc/iptables.up.rules
+	echo "Setting up GRE tunnel"
+	nmcli connection add type ip-tunnel ip-tunnel.mode gre con-name gre1 ifname gre1 remote 20.20.20.100 local 10.10.10.1 >/dev/null 2>&1
+	nmcli connection modify gre1 ipv4.addresses '10.5.5.1/30'
+	nmcli connection modify gre1 ipv4.method manual
+	echo "Saving rules and making persistent..."
+	cat > /etc/network/if-up.d/ipTables.sh << EOF
+#!/bin/bash
+	iptables-restore /etc/iptables.up.rules
+	sleep 5
+	ip tunnel change gre1 ttl 255
+EOF
+	chmod 777 /etc/network/if-up.d/ipTables.sh
+}
+
+ospf() {
+	echo "Configuring OSPF"
+	sed -i.bak "s/ospfd.*/ospfd=yes/g" /etc/frr/daemons
+	systemctl restart frr
+	cat > /etc/frr/frr.conf << EOF
+frr version 6.0.2
+frr defaults traditional
+hostname $hostN
+log syslog informational
+no ipv6 forwarding
+service integrated-vtysh-config
+!
+router-id 1.1.1.1
+!
+router ospf
+ passive-interface ens224
+ network 10.5.5.0/30 area 0
+ network 5.5.5.0/27 area 0
+ network 172.16.20.0/24 area 0
+ network 172.16.50.0/30 area 0
+ network 172.16.55.0/30 area 0
+!
+line vty
+!
+EOF
+	systemctl restart frr
+	ip tunnel change gre1 ttl 255
+}
+
+hosts() {
+	echo "Adding hostnames to /etc/hosts"
+	cat >> /etc/hosts << EOF
+10.10.10.10	ISP
+10.10.10.1	L-FW
+20.20.20.5	OUT-CLI
+20.20.20.100	R-FW
+172.16.20.10	L-SRV
+172.16.50.2	L-RTR-A
+#172.16.100.61	L-CLI-A
+172.16.55.2	L-RTR-B
+172.16.200.61	L-CLI-B
+192.168.20.10	R-SRV
+192.168.10.2	R-RTR
+192.168.100.100	R-CLI
+EOF
+}
+
+sshdEdit() {
+	echo "Permitting root login"
+	sed -i.bak "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config
+	echo "Adding ssh_p and ssh_c"
+	useradd -m -p 1 ssh_p && useradd -m -p 1 ssh_c
+	echo -e "ssh_p:ssh_pass\nssh_c:ssh_pass" | chpasswd
+	echo "Restarting sshd..."
+	systemctl restart sshd
+}
+
+ovpn() {
+	echo "Configuring OpenVPN server..."
+	cat > /etc/openvpn/server.conf << EOF
+local 10.10.10.1
+port 1122
+proto udp
+dev tun
+ca /opt/vpn/ca.crt
+cert /opt/vpn/l-fw.crt
+key /opt/vpn/l-fw.key
+dh /opt/vpn/dh2048.pem
+
+topology subnet
+server 5.5.5.0 255.255.255.224
+ifconfig-pool-persist /opt/vpn/ipp.txt
+keepalive 10 120
+comp-lzo
+push "route 172.16.0.0 255.255.0.0"
+push "route 192.168.0.0 255.255.0.0"
+push "dhcp-option DNS 172.16.20.10"
+persist-key
+persist-tun
+status /opt/vpn/openvpn-status.log
+log-append /opt/vpn/openvpn.log
+verb 3
+explicit-exit-notify 1
+EOF
+	mkdir -p /opt/vpn
+	cat /dev/zero | ssh-keygen -q -N ""
+	sshpass -p toor ssh-copy-id -o StrictHostKeyChecking=no 20.20.20.100
+	openssl dhparam -out /opt/vpn/dh2048.pem 2048
+	scp 20.20.20.100:/etc/ca/ca.crt /usr/share/ca-certificates/ca.crt
+	update-ca-certificates
+	cp /usr/share/ca-certificates/ca.crt /opt/vpn/ca.crt
+	scp 20.20.20.100:/etc/ca/l-fw.crt /opt/vpn/l-fw.crt
+	scp 20.20.20.100:/etc/ca/l-fw.key /opt/vpn/l-fw.key
+
+	systemctl enable openvpn
+	systemctl start openvpn
+	# OMG, fuck ovpn and OpenSSL
+}
+
+ipSec() {
+	cat >> /etc/ipsec.d/vpn.conf << EOF
+conn vpn
+	auto=start
+	type=tunnel
+	authby=secret
+	ike=3des-sha1;dh14
+	esp=aes-sha2
+	left=10.10.10.1
+	right=20.20.20.100
+	pfs=no
+EOF
+	echo '10.10.10.1 20.20.20.100 : PSK "WSR 2019"' > /etc/ipsec.d/vpn.secrets
+	ipsec start
+	systemctl enable ipsec
+}
+
+rSysLogD() {
+	echo "*.*@172.16.20.10" >> /etc/rsyslog.conf
+	systemctl restart rsyslog.conf
+	logger -p mail.err test
+}
+
+cleanup() {
+	echo "Cleaning up and disabling history..."
+	echo 'set +o history' >> /etc/profile
+	history -c
+}
+
+ipConfig
+baseDeb
+sshdEdit
+hosts
+ipTablesGRE
+ospf
+ovpn
+ipSec
+rSysLogD
+
+if [[ $cleanupswitch == 1 ]]; then cleanup; fi
+
+echo DONE
+rm -f $0
+sleep 120
+reboot

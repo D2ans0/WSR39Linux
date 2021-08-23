@@ -1,0 +1,157 @@
+#!/bin/sh
+
+#hostname
+export hostN="OUT-CLI"
+
+
+export if1N="ens192"
+export if1IP="20.20.20.5"
+export if1Mask="255.255.255.0"
+export if1CIDR="/24"
+export defGW="20.20.20.10"
+export cleanupswitch=0
+
+
+    #base setup
+echo "Setting hostname and enabling packet forwarding..."
+echo $hostN > /etc/hostname
+echo net.ipv4.ip_forward=1 > /etc/sysctl.conf
+#sed -i.bak 's%files dns%dns files%g' /etc/nsswitch.conf
+
+#ip config
+ipConfig() {
+echo "Replacing net config... "
+cat > /etc/sysconfig/network-scripts/ifcfg-$if1N << EOF
+DEVICE=$if1N
+ONBOOT=yes
+IPADDR=$if1IP
+NETMASK=$if1Mask
+GATEWAY=$defGW
+EOF
+ifdown $if1N > /etc/null
+ifup $if1N > /etc/null
+}
+
+ipTablesGRE() {
+    echo "Adding iptables NAT rule..."
+	iptables --flush
+    iptables -t nat -A POSTROUTING -o ens192 -j MASQUERADE #only on FW
+	echo "Saving rules and making persistent..."
+    iptables-save > /etc/iptables.up.rules
+    cat > /etc/NetworkManager/dispatcher.d/10-iptables << EOF
+#!/bin/sh
+
+if [[ \$1 != "ens192" ]] || [[ \$2 != "up" ]]
+then
+	logger "\$0: Working on eth192 ..."
+	iptables-restore /etc/iptables.up.rules
+fi
+
+EOF
+    chmod 744 /etc/NetworkManager/dispatcher.d/10-iptables
+}
+
+baseCentOS() {
+    echo "Disabling firewall and SELinux..."
+    systemctl disable -q --now firewalld #allow pings
+    echo SELINUX=disabled > /etc/selinux/config
+    echo "Mounting disks..."
+	mkdir /media/cdrom
+	mount -r /dev/sr1 /media/cdrom
+	mkdir /media/CentOS
+	mount -r /dev/sr0 /media/CentOS
+	echo "Installing packages..."
+	yum --disablerepo=* --enablerepo=c7-media -q makecache >/dev/null 2>&1
+	yum --disablerepo=* --enablerepo=c7-media -q -y install tcpdump net-tools vim lynx bind-utils nfs-utils cifs-utils openssh-server nano >/dev/null 2>&1
+	yum --disablerepo=* --enablerepo=c7-media -y install $(find /media/ -name sshpass*) $(find /media/ -name pkc*) $(find /media/ -name openvpn*) >/dev/null 2>&1
+	echo "Packages installed"
+}
+
+hosts() {
+	echo "Adding hostnames to /etc/hosts"
+	cat >> /etc/hosts << EOF
+10.10.10.10	ISP
+10.10.10.1	L-FW
+20.20.20.5	OUT-CLI
+20.20.20.100	R-FW
+172.16.20.10	L-SRV
+172.16.50.2	L-RTR-A
+#172.16.100.61	L-CLI-A
+172.16.55.2	L-RTR-B
+172.16.200.61	L-CLI-B
+192.168.20.10	R-SRV
+192.168.10.2	R-RTR
+192.168.100.100	R-CLI
+EOF
+}
+
+sshdEdit() {
+	echo "Permitting root login"
+	sed -i.bak "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config 
+	echo "Generating keys and exporting to L-FW"
+	mkdir .ssh
+	cat > .ssh/config << EOF
+Host *
+	StrictHostKeyChecking no
+EOF
+
+	cat /dev/zero | ssh-keygen -q -N ""
+	sshpass -p ssh_pass ssh-copy-id -o StrictHostKeyChecking=no ssh_c@l-fw
+	echo "Restarting sshd..."
+	systemctl restart sshd
+}
+
+ovpn() {
+	echo "Configuring OpenVPN client..."
+	cat > /etc/openvpn/client.conf << EOF
+client
+dev tun
+proto udp
+remote 10.10.10.1 1122
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+ca /opt/vpn/ca.crt
+cert /opt/vpn/out-cli.crt
+key /opt/vpn/out-cli.key
+comp-lzo
+EOF
+	mkdir -p /opt/vpn
+	cat /dev/zero | ssh-keygen -q -N ""
+	sshpass -p toor ssh-copy-id -o StrictHostKeyChecking=no 20.20.20.100
+	scp 20.20.20.100:/etc/ca/ca.crt /etc/pki/ca-trust/source/anchors/
+	update-ca-trust extract
+	cp /etc/pki/ca-trust/source/anchors/ca.crt /opt/vpn/ca.crt
+	scp 20.20.20.100:/etc/ca/out-cli.crt /opt/vpn/out-cli.crt
+	scp 20.20.20.100:/etc/ca/out-cli.key /opt/vpn/out-cli.key
+
+	systemctl enable openvpn@client
+	systemctl start openvpn@client
+	# OMG, fuck ovpn and OpenSSL
+	
+	echo systemctl start openvpn@client > /opt/vpn/start_vpn.sh
+	echo systemctl stop openvpn@client > /opt/vpn/stop_vpn.sh
+	chmod +x /opt/vpn/st*
+	ln -s /opt/vpn/start_vpn.sh /bin/start_vpn
+	ln -s /opt/vpn/stop_vpn.sh /bin/stop_vpn
+}
+
+cleanup() {
+	echo 'set +o history' >> /etc/profile
+	history -c
+}
+
+ipConfig
+baseCentOS
+hosts
+ipTablesGRE
+sshdEdit
+ovpn
+
+if [[ $cleanupswitch == 1 ]]; then cleanup; fi
+
+echo DONE
+rm -f $0
+sleep 120
+reboot
